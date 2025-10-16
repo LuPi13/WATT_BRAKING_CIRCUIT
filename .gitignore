@@ -1,0 +1,36 @@
+# Build output directories
+Debug/
+Release/
+build/
+
+# STM32CubeIDE user-specific settings
+.settings/
+
+# Build artifacts and generated files
+*.o
+*.d
+*.su
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+*.srec
+
+# STM32CubeMX backup files
+*.ioc.bak
+
+# Log files
+*.log
+
+# Other IDE files
+*.launch
+
+# Common temporary files
+*~
+*.swp
+*.bak
+
+# Operating System generated files
+.DS_Store
+Thumbs.db
