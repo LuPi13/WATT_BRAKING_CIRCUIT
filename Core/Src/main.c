@@ -99,6 +99,13 @@ static float Kp = 0.05f;
 static float Ki = 0.50f;
 static float I  = 0.0f; // 적분 상태
 
+
+/* CAN-BUS */
+FDCAN_TxHeaderTypeDef   TxHeader;
+FDCAN_RxHeaderTypeDef   RxHeader;
+uint8_t               TxData[8];
+uint8_t               RxData[8];
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -343,6 +350,18 @@ int main(void)
   BrakePWM_Start();
   HAL_TIM_Base_Start_IT(&htim7);
   UART_Q_Init();
+  
+  /* FDCAN Start */
+  if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  if (HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -590,6 +609,20 @@ static void MX_FDCAN2_Init(void)
   }
   /* USER CODE BEGIN FDCAN2_Init 2 */
 
+  
+  FDCAN_FilterTypeDef sFilterConfig;
+
+  sFilterConfig.IdType = FDCAN_STANDARD_ID;
+  sFilterConfig.FilterIndex = 0;
+  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RX_FIFO0;
+  sFilterConfig.FilterID1 = 0x101;
+  sFilterConfig.FilterID2 = 0x7FF; // Mask: all bits must match
+
+  if (HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilterConfig) != HAL_OK)
+  {
+      Error_Handler();
+  }
   /* USER CODE END FDCAN2_Init 2 */
 
 }
@@ -842,7 +875,79 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
+
 /* USER CODE BEGIN 4 */
+
+/**
+  * @brief  FDCAN Tx, 응답 전송
+  * @note   ID:0x100, DLC:8
+  */
+void CAN_Send_Status_Response(void)
+{
+    // 1. 최신 동시 샘플 추출
+    uint16_t v_code, i_code;
+    ReadLatest(&v_code, &i_code);
+
+    // 2. 물리량으로 변환
+    uint16_t voltage_mv = (uint16_t)Code_to_VmV(v_code);
+    uint16_t current_ma = (uint16_t)Code_to_ImA(i_code);
+    uint16_t duty_permille = (uint16_t)(g_brake_duty * 1000.0f);
+
+    // 3. 핀 상태 읽기
+    uint8_t pin_status = 0;
+    pin_status |= (PWM_InstantBit() & 0x01) << 1;    // Bit 1: PWM 핀
+    pin_status |= (GPIO_InstantBit() & 0x01) << 0;   // Bit 0: 히스테리시스 핀
+
+    // 4. CAN Tx 메시지 설정
+    TxHeader.Identifier = 0x100;
+    TxHeader.IdType = FDCAN_STANDARD_ID;
+    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+    TxHeader.DataLength = FDCAN_DLC_BYTES_8;
+    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+    TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    TxHeader.MessageMarker = 0;
+
+    // 5. 데이터 패킹 (Big-Endian)
+    TxData[0] = (voltage_mv >> 8) & 0xFF;
+    TxData[1] = voltage_mv & 0xFF;
+    TxData[2] = (current_ma >> 8) & 0xFF;
+    TxData[3] = current_ma & 0xFF;
+    TxData[4] = (duty_permille >> 8) & 0xFF;
+    TxData[5] = duty_permille & 0xFF;
+    TxData[6] = pin_status;
+    TxData[7] = 0x00; // Reserved
+
+    // 6. 메시지 전송
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK)
+    {
+        // 전송 실패
+        Error_Handler();
+    }
+}
+
+/**
+  * @brief  FDCAN Rx FIFO 0 수신 콜백
+  * @note   ID 0x101 메시지 수신 시 호출됨
+  */
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
+    {
+        // FIFO 0에서 메시지 수신
+        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+        {
+            Error_Handler();
+        }
+
+        // 요청 메시지인지 확인 (ID: 0x101, DLC: 1, Data: 0x01)
+        if (RxHeader.Identifier == 0x101 && RxHeader.DataLength == FDCAN_DLC_BYTES_1 && RxData[0] == 0x01)
+        {
+            CAN_Send_Status_Response();
+        }
+    }
+}
 
 /**
  * @brief 반핑퐁 함수
