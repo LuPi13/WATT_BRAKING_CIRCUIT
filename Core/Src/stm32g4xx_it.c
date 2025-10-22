@@ -59,6 +59,7 @@ extern DMA_HandleTypeDef hdma_adc1;
 extern DMA_HandleTypeDef hdma_adc2;
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
+extern FDCAN_HandleTypeDef hfdcan2;
 extern TIM_HandleTypeDef htim7;
 /* USER CODE BEGIN EV */
 
@@ -257,6 +258,34 @@ void TIM7_DAC_IRQHandler(void)
   /* USER CODE BEGIN TIM7_DAC_IRQn 1 */
 
   /* USER CODE END TIM7_DAC_IRQn 1 */
+}
+
+/**
+  * @brief This function handles FDCAN2 interrupt 0.
+  */
+void FDCAN2_IT0_IRQHandler(void)
+{
+  /* USER CODE BEGIN FDCAN2_IT0_IRQn 0 */
+
+  /* USER CODE END FDCAN2_IT0_IRQn 0 */
+  HAL_FDCAN_IRQHandler(&hfdcan2);
+  /* USER CODE BEGIN FDCAN2_IT0_IRQn 1 */
+
+  /* USER CODE END FDCAN2_IT0_IRQn 1 */
+}
+
+/**
+  * @brief This function handles FDCAN2 interrupt 1.
+  */
+void FDCAN2_IT1_IRQHandler(void)
+{
+  /* USER CODE BEGIN FDCAN2_IT1_IRQn 0 */
+
+  /* USER CODE END FDCAN2_IT1_IRQn 0 */
+  HAL_FDCAN_IRQHandler(&hfdcan2);
+  /* USER CODE BEGIN FDCAN2_IT1_IRQn 1 */
+
+  /* USER CODE END FDCAN2_IT1_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */

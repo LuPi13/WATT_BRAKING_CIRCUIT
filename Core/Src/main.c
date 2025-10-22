@@ -391,10 +391,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
   RCC_OscInitStruct.PLL.PLLN = 8;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
@@ -592,10 +593,10 @@ static void MX_FDCAN2_Init(void)
   hfdcan2.Init.AutoRetransmission = DISABLE;
   hfdcan2.Init.TransmitPause = DISABLE;
   hfdcan2.Init.ProtocolException = DISABLE;
-  hfdcan2.Init.NominalPrescaler = 16;
+  hfdcan2.Init.NominalPrescaler = 8;
   hfdcan2.Init.NominalSyncJumpWidth = 1;
-  hfdcan2.Init.NominalTimeSeg1 = 1;
-  hfdcan2.Init.NominalTimeSeg2 = 1;
+  hfdcan2.Init.NominalTimeSeg1 = 5;
+  hfdcan2.Init.NominalTimeSeg2 = 2;
   hfdcan2.Init.DataPrescaler = 1;
   hfdcan2.Init.DataSyncJumpWidth = 1;
   hfdcan2.Init.DataTimeSeg1 = 1;
@@ -614,10 +615,10 @@ static void MX_FDCAN2_Init(void)
 
   sFilterConfig.IdType = FDCAN_STANDARD_ID;
   sFilterConfig.FilterIndex = 0;
-  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
-  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RX_FIFO0;
+  sFilterConfig.FilterType = FDCAN_FILTER_DUAL;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
   sFilterConfig.FilterID1 = 0x101;
-  sFilterConfig.FilterID2 = 0x7FF; // Mask: all bits must match
+  sFilterConfig.FilterID2 = 0x7FF;
 
   if (HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilterConfig) != HAL_OK)
   {
@@ -875,7 +876,6 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
-
 /* USER CODE BEGIN 4 */
 
 /**
@@ -923,7 +923,7 @@ void CAN_Send_Status_Response(void)
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK)
     {
         // 전송 실패
-        Error_Handler();
+//        Error_Handler();
     }
 }
 
