@@ -58,6 +58,12 @@
 // PI 제어 및 duty 적용 주기
 #define CTRL_Ts (0.0002f)
 #define V_REF (42.0f)
+
+// LPF
+#define SAMPLING_FREQ 125000.0f
+#define CUTOFF_FREQ   1000.0f
+#define PI            3.14159265359f
+#define LPF_ALPHA     ( (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ) )
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -93,6 +99,10 @@ volatile uint8_t gpio_gate_on = 0; // GPIO 제어 핀 상태
 volatile uint8_t pwm_on = 0; // PWM 제어 핀 상태
 
 volatile float g_brake_duty = 0.0f; // 디버그, 모니터링용
+
+// LPF 상태 변수
+static float filtered_v_code = 0.0f;
+static float filtered_i_code = 0.0f;
 
 // PI 제어
 static float Kp = 0.05f;
@@ -133,7 +143,7 @@ void ADC_StartAll(void) {
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)v_buf, V_BUF_LEN);
     HAL_ADC_Start_DMA(&hadc2, (uint32_t*)i_buf, I_BUF_LEN);
 
-    HAL_TIM_Base_Start(&htim6);
+    HAL_TIM_Base_Start_IT(&htim6);
 }
 
 //GPIO 히스테리시스 제어용
@@ -278,13 +288,13 @@ static void UART_HandleLine(const char* line_in) {
 
     if (strcmp(line, "Q") == 0) { // Q 명령: 현재 V, I, GPIO상태, PWM상태, PWM추기 출력
 
-        // 최신 동시 샘플 추출
+        // 최신 동시 샘플 추출 (전류만 사용)
         uint16_t v_code, i_code;
         ReadLatest(&v_code, &i_code);
 
-        // 물리량 환산
-        int32_t v_mV = Code_to_VmV(v_code);
-        int32_t i_mA = Code_to_ImA(i_code);
+        // 물리량 환산 (전압/전류 모두 필터링된 값 사용)
+        int32_t v_mV = Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
+        int32_t i_mA = Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
 
         // 상태 스냅샷
         uint8_t gpio   = GPIO_InstantBit();
@@ -340,17 +350,22 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
-//  MX_TIM1_Init();
+  MX_TIM1_Init();
   MX_FDCAN2_Init();
   MX_USART2_UART_Init();
   MX_TIM6_Init();
-//  MX_TIM7_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
   ADC_StartAll();
   BrakePWM_Start();
   HAL_TIM_Base_Start_IT(&htim7);
   UART_Q_Init();
   
+  // LPF 상태 변수 초기화 (첫 ADC 값으로)
+  HAL_Delay(1); // ADC 안정화 대기
+  filtered_v_code = (float)HAL_ADC_GetValue(&hadc1);
+  filtered_i_code = (float)HAL_ADC_GetValue(&hadc2);
+
   /* FDCAN Start */
   if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
   {
@@ -433,7 +448,6 @@ static void MX_ADC1_Init(void)
   /* USER CODE END ADC1_Init 0 */
 
   ADC_MultiModeTypeDef multimode = {0};
-  ADC_AnalogWDGConfTypeDef AnalogWDGConfig = {0};
   ADC_ChannelConfTypeDef sConfig = {0};
 
   /* USER CODE BEGIN ADC1_Init 1 */
@@ -471,20 +485,6 @@ static void MX_ADC1_Init(void)
   */
   multimode.Mode = ADC_MODE_INDEPENDENT;
   if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Analog WatchDog 1
-  */
-  AnalogWDGConfig.WatchdogNumber = ADC_ANALOGWATCHDOG_1;
-  AnalogWDGConfig.WatchdogMode = ADC_ANALOGWATCHDOG_SINGLE_REG;
-  AnalogWDGConfig.Channel = ADC_CHANNEL_1;
-  AnalogWDGConfig.ITMode = ENABLE;
-  AnalogWDGConfig.HighThreshold = 2430;
-  AnalogWDGConfig.LowThreshold = 2400;
-  AnalogWDGConfig.FilteringConfig = ADC_AWD_FILTERING_NONE;
-  if (HAL_ADC_AnalogWDGConfig(&hadc1, &AnalogWDGConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -883,13 +883,13 @@ static void MX_GPIO_Init(void)
   */
 void CAN_Send_Status_Response(void)
 {
-    // 1. 최신 동시 샘플 추출
+    // 1. 최신 동시 샘플 추출 (전류만 사용)
     uint16_t v_code, i_code;
     ReadLatest(&v_code, &i_code);
 
-    // 2. 물리량으로 변환
-    uint16_t voltage_mv = (uint16_t)Code_to_VmV(v_code);
-    uint16_t current_ma = (uint16_t)Code_to_ImA(i_code);
+    // 2. 물리량으로 변환 (전압/전류 모두 필터링된 값 사용)
+    uint16_t voltage_mv = (uint16_t)Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
+    uint16_t current_ma = (uint16_t)Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
     uint16_t duty_permille = (uint16_t)(g_brake_duty * 1000.0f);
 
     // 3. 핀 상태 읽기
@@ -978,18 +978,18 @@ void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
  * @brief AWD outOfWindow콜백을 통한 GPIO 제어
  * @note 클램프high전압보다 크면 게이트 켜고, 클램프low전압보다 작으면 게이트 끔
  */
-void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef* hadc) {
-    if (hadc->Instance == ADC1) {
-        uint16_t v = (uint16_t) HAL_ADC_GetValue(hadc);
-
-        if (!gpio_gate_on && v > AWD_HIGH_CODE) {
-            GPIO_GateOn();
-        }
-        else if (gpio_gate_on && v < AWD_LOW_CODE) {
-            GPIO_GateOff();
-        }
-    }
-}
+//void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef* hadc) {
+//    if (hadc->Instance == ADC1) {
+//        uint16_t v = (uint16_t) HAL_ADC_GetValue(hadc);
+//
+//        if (!gpio_gate_on && v > AWD_HIGH_CODE) {
+//            GPIO_GateOn();
+//        }
+//        else if (gpio_gate_on && v < AWD_LOW_CODE) {
+//            GPIO_GateOff();
+//        }
+//    }
+//}
 
 /**
  * @brief TIM_period 콜백함수
@@ -1004,6 +1004,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
         float d = BrakePI_Step(v_bus, V_REF, CTRL_Ts);
         BrakePWM_SetDuty(d);
+    }
+    else if (htim->Instance == TIM6) {
+        // 125kHz로 실행되는 LPF 및 히스테리시스 제어
+        uint16_t v = (uint16_t) HAL_ADC_GetValue(&hadc1);
+        uint16_t i = (uint16_t) HAL_ADC_GetValue(&hadc2);
+
+        // LPF 적용
+        filtered_v_code += LPF_ALPHA * ((float)v - filtered_v_code);
+        filtered_i_code += LPF_ALPHA * ((float)i - filtered_i_code);
+
+        // 필터링된 값으로 히스테리시스 제어
+        if (!gpio_gate_on && filtered_v_code > (float)AWD_HIGH_CODE) {
+            GPIO_GateOn();
+        }
+        else if (gpio_gate_on && filtered_v_code < (float)AWD_LOW_CODE) {
+            GPIO_GateOff();
+        }
     }
 }
 
