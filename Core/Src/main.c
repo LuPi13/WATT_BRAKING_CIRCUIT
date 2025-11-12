@@ -43,9 +43,9 @@
 #define GATE_GPIO_PORT GPIOA
 #define GATE_GPIO_PIN  GPIO_PIN_9
 
-// AWD 임계(3.3V, 1/40 분배에서 43V/41V)
-#define AWD_HIGH_CODE 1334U
-#define AWD_LOW_CODE  1272U
+// AWD 임계(3.3V, 1/40 분배)
+#define AWD_HIGH_CODE 2430U
+#define AWD_LOW_CODE  2400U
 
 // TIM1 PWM 채널
 #define BRAKE_TIM    (&htim1)
@@ -86,8 +86,8 @@ uint16_t v_buf[V_BUF_LEN]; // ADC1(전압) DMA 버퍼
 uint16_t i_buf[I_BUF_LEN]; // ADC2(전류) DMA 버퍼
 
 // 최신 샘플 캐시: DMA 콜백에서 갱신하여 사용
-volatile uint16_t v_latest = 0;
-volatile uint16_t i_latest = 0;
+uint16_t v_latest = 0;
+uint16_t i_latest = 0;
 
 volatile uint8_t gpio_gate_on = 0; // GPIO 제어 핀 상태
 volatile uint8_t pwm_on = 0; // PWM 제어 핀 상태
@@ -222,7 +222,7 @@ float BrakePI_Step(float v_meas, float v_ref, float Ts) {
 
 // adc값->mV
 static inline int16_t Code_to_VmV(uint16_t code) {
-    float v_bus = ((float) code * 3.3f / 4095.0f) * 40.0;
+    float v_bus = ((float) code - 2048.0) * 3.3f * 40.0f / 2047.0f;
     int32_t mV = (int32_t)(v_bus * 1000.0f + 0.5f);
     if (mV < 0) mV = 0;
     return mV;
@@ -391,11 +391,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
   RCC_OscInitStruct.PLL.PLLN = 8;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
@@ -481,9 +480,9 @@ static void MX_ADC1_Init(void)
   AnalogWDGConfig.WatchdogNumber = ADC_ANALOGWATCHDOG_1;
   AnalogWDGConfig.WatchdogMode = ADC_ANALOGWATCHDOG_SINGLE_REG;
   AnalogWDGConfig.Channel = ADC_CHANNEL_1;
-  AnalogWDGConfig.ITMode = DISABLE;
-  AnalogWDGConfig.HighThreshold = 1334;
-  AnalogWDGConfig.LowThreshold = 1272;
+  AnalogWDGConfig.ITMode = ENABLE;
+  AnalogWDGConfig.HighThreshold = 2430;
+  AnalogWDGConfig.LowThreshold = 2400;
   AnalogWDGConfig.FilteringConfig = ADC_AWD_FILTERING_NONE;
   if (HAL_ADC_AnalogWDGConfig(&hadc1, &AnalogWDGConfig) != HAL_OK)
   {
