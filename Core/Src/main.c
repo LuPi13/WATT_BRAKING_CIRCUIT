@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32h7xx_hal.h" // For GPIOA and uint16_t
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -61,7 +62,7 @@
 
 // LPF
 #define SAMPLING_FREQ 125000.0f
-#define CUTOFF_FREQ   1000.0f
+#define CUTOFF_FREQ   20.0f
 #define PI            3.14159265359f
 #define LPF_ALPHA     ( (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ) )
 /* USER CODE END PD */
@@ -146,13 +147,13 @@ void ADC_StartAll(void) {
     HAL_TIM_Base_Start_IT(&htim6);
 }
 
-//GPIO 히스테리시스 제어용
+//GPIO 히스테리시스 제어용 (최적화: 직접 레지스터 접근)
 static inline void GPIO_GateOn(void) {
-    HAL_GPIO_WritePin(GATE_GPIO_PORT, GATE_GPIO_PIN, GPIO_PIN_SET);
+    GPIOA->BSRR = GPIO_PIN_9;  // 직접 레지스터 쓰기 (HAL 방식보다 빠름)
     gpio_gate_on = 1;
 }
 static inline void GPIO_GateOff(void) {
-    HAL_GPIO_WritePin(GATE_GPIO_PORT, GATE_GPIO_PIN, GPIO_PIN_RESET);
+    GPIOA->BSRR = (uint32_t)GPIO_PIN_9 << 16U;  // Reset 비트
     gpio_gate_on = 0;
 }
 
@@ -350,15 +351,15 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
-  MX_TIM1_Init();
+  // MX_TIM1_Init();
   MX_FDCAN2_Init();
   MX_USART2_UART_Init();
   MX_TIM6_Init();
-  MX_TIM7_Init();
+  // MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
   ADC_StartAll();
-  BrakePWM_Start();
-  HAL_TIM_Base_Start_IT(&htim7);
+  // BrakePWM_Start();
+  // HAL_TIM_Base_Start_IT(&htim7); // PI 제어 사용 안 함
   UART_Q_Init();
   
   // LPF 상태 변수 초기화 (첫 ADC 값으로)
@@ -993,7 +994,8 @@ void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
 
 /**
  * @brief TIM_period 콜백함수
- * @note TIM7: PI제어 계산 및 duty 적용
+ * @note TIM6: LPF 및 히스테리시스 제어
+ *       TIM7: PI 제어 (현재 코드에 포함되어 있으나, TIM7은 기본적으로 시작되지 않음. 필요시 HAL_TIM_Base_Start_IT(&htim7)로 활성화 가능)
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM7) {
@@ -1005,8 +1007,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         float d = BrakePI_Step(v_bus, V_REF, CTRL_Ts);
         BrakePWM_SetDuty(d);
     }
-    else if (htim->Instance == TIM6) {
         // 125kHz로 실행되는 LPF 및 히스테리시스 제어
+        // HAL 함수를 사용하여 ADC 값 읽기 (125kHz 빠른 샘플링)
         uint16_t v = (uint16_t) HAL_ADC_GetValue(&hadc1);
         uint16_t i = (uint16_t) HAL_ADC_GetValue(&hadc2);
 
