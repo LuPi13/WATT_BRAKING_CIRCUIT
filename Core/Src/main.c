@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stm32h7xx_hal.h" // For GPIOA and uint16_t
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -45,24 +44,12 @@
 #define GATE_GPIO_PIN  GPIO_PIN_9
 
 // AWD 임계(3.3V, 1/40 분배)
-#define AWD_HIGH_CODE 2430U
-#define AWD_LOW_CODE  2400U
-
-// TIM1 PWM 채널
-#define BRAKE_TIM    (&htim1)
-#define BRAKE_TIM_CH TIM_CHANNEL_1
-
-// PWM duty
-#define DUTY_MIN 0.0f
-#define DUTY_MAX 1.0f
-
-// PI 제어 및 duty 적용 주기
-#define CTRL_Ts (0.0002f)
-#define V_REF (42.0f)
+#define AWD_HIGH_CODE 2450U // 25.5V (Heuristic)
+#define AWD_LOW_CODE  2397U // 22.5V
 
 // LPF
 #define SAMPLING_FREQ 125000.0f
-#define CUTOFF_FREQ   20.0f
+#define CUTOFF_FREQ   1000.0f
 #define PI            3.14159265359f
 #define LPF_ALPHA     ( (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ) )
 /* USER CODE END PD */
@@ -80,9 +67,7 @@ DMA_HandleTypeDef hdma_adc2;
 
 FDCAN_HandleTypeDef hfdcan2;
 
-TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim6;
-TIM_HandleTypeDef htim7;
 
 UART_HandleTypeDef huart2;
 
@@ -99,16 +84,10 @@ uint16_t i_latest = 0;
 volatile uint8_t gpio_gate_on = 0; // GPIO 제어 핀 상태
 volatile uint8_t pwm_on = 0; // PWM 제어 핀 상태
 
-volatile float g_brake_duty = 0.0f; // 디버그, 모니터링용
 
-// LPF 상태 변수
-static float filtered_v_code = 0.0f;
-static float filtered_i_code = 0.0f;
-
-// PI 제어
-static float Kp = 0.05f;
-static float Ki = 0.50f;
-static float I  = 0.0f; // 적분 상태
+// LPF 상태 변수 (통신용 - 외부 접근)
+static volatile float filtered_v_code = 0.0f;
+static volatile float filtered_i_code = 0.0f;
 
 
 /* CAN-BUS */
@@ -125,11 +104,9 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
-static void MX_TIM1_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM6_Init(void);
-static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 void ADC_StartAll(void);
 /* USER CODE END PFP */
@@ -144,7 +121,8 @@ void ADC_StartAll(void) {
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)v_buf, V_BUF_LEN);
     HAL_ADC_Start_DMA(&hadc2, (uint32_t*)i_buf, I_BUF_LEN);
 
-    HAL_TIM_Base_Start_IT(&htim6);
+    // TIM6 시작은 외부에서 (초기화 후) 하도록 변경
+    // HAL_TIM_Base_Start_IT(&htim6);
 }
 
 //GPIO 히스테리시스 제어용 (최적화: 직접 레지스터 접근)
@@ -157,78 +135,9 @@ static inline void GPIO_GateOff(void) {
     gpio_gate_on = 0;
 }
 
-// PWM Start
-void BrakePWM_Start(void) {
-    // 0%로 세팅 후 시작 (글리치 방지)
-    __HAL_TIM_SET_COMPARE(BRAKE_TIM, BRAKE_TIM_CH, 0);
-    HAL_TIM_PWM_Start(BRAKE_TIM, BRAKE_TIM_CH);
-    g_brake_duty = 0.0f;
-}
-
-// PWM Stop
-void BrakePWM_Stop(void) {
-    HAL_TIM_PWM_Stop(BRAKE_TIM, BRAKE_TIM_CH);
-    g_brake_duty = 0.0f;
-}
-
-// duty 설정 함수
-void BrakePWM_SetDuty(float d) {
-    if (d < DUTY_MIN) d = DUTY_MIN;
-    if (d > DUTY_MAX) d = DUTY_MAX;
-
-    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(BRAKE_TIM);
-    uint32_t ccr = (uint32_t) ((arr + 1U) * d);
-
-    __HAL_TIM_SET_COMPARE(BRAKE_TIM, BRAKE_TIM_CH, ccr);
-    g_brake_duty = d;
-}
-
 // GPIO 제어핀 상태
 static inline uint8_t GPIO_InstantBit(void) {
     return (HAL_GPIO_ReadPin(GATE_GPIO_PORT, GATE_GPIO_PIN) == GPIO_PIN_SET) ? 1u : 0u;
-}
-
-// PWM High-Low 상태 계산
-static uint8_t PWM_InstantBit(void) {
-    // 실제 출력이 나가려면 MOE와 CC1E가 켜져 있어야 함
-    if (!(TIM1->BDTR & TIM_BDTR_MOE) || !(TIM1->CCER & TIM_CCER_CC1E)) return 0u;
-
-    uint32_t cnt = TIM1->CNT;
-    uint32_t ccr = TIM1->CCR1;
-    uint32_t arr = TIM1->ARR;
-
-    if (ccr == 0u)         return 0u; // 항상 Low
-    if (ccr >= (arr + 1u)) return 1u; // 항상 High
-
-    // PWM mode 1, Up-count: CNT < CCR 구간이 Active
-    uint8_t active = (cnt < ccr) ? 1u : 0u;
-
-    return active;
-}
-
-// PI 한 스텝 계산 후 duty 반환
-float BrakePI_Step(float v_meas, float v_ref, float Ts) {
-    float e = v_ref - v_meas;
-    float pre = Kp * e + I; // p 적용
-
-    // 출력 클램프
-    float u = pre;
-    if (u > DUTY_MAX) u = DUTY_MAX;
-    else if (u < DUTY_MIN) u = DUTY_MIN;
-
-    // Anti-windup (조건부 적분)
-    // 출력이 포화되지 않았거나, 포화되었더라도 '그 방향으로 더 밀지 않는' 경우에만 적분
-    float integ_candidate = I + Ki * e * Ts; // 적분오차 계산
-    float pre_if_integ = Kp * e + integ_candidate; // 적분오차 고려 duty
-
-    // 적분 클램프
-    if ( (pre < DUTY_MAX && pre > DUTY_MIN) ||
-         (pre >= DUTY_MAX && pre_if_integ <= DUTY_MAX) ||
-         (pre <= DUTY_MIN && pre_if_integ >= DUTY_MIN) ) {
-        I = integ_candidate;
-    }
-
-    return u;
 }
 
 // adc값->mV
@@ -297,14 +206,12 @@ static void UART_HandleLine(const char* line_in) {
         int32_t v_mV = Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
         int32_t i_mA = Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
 
-        // 상태 스냅샷
+        // 히스테리시스 gate 핀 상태
         uint8_t gpio   = GPIO_InstantBit();
-        uint8_t pwm_on = PWM_InstantBit();
 
-        uint32_t arr = __HAL_TIM_GET_AUTORELOAD(BRAKE_TIM);
-        uint32_t ccr = __HAL_TIM_GET_COMPARE(BRAKE_TIM, BRAKE_TIM_CH);
-        int duty_ppt = (arr+1u) ? (int)((float)ccr / (float)(arr+1u) * 1000.0f + 0.5f) : 0; // duty 퍼밀 계산
-        if (duty_ppt > 1000) duty_ppt = 1000;
+        // PWM 채널 미사용으로 인한 0 전송
+        uint8_t pwm_on = 0;
+        int duty_ppt = 0;
 
         // 한 줄 응답
         char msg[84];
@@ -351,11 +258,9 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
-  // MX_TIM1_Init();
   MX_FDCAN2_Init();
   MX_USART2_UART_Init();
   MX_TIM6_Init();
-  // MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
   ADC_StartAll();
   // BrakePWM_Start();
@@ -363,9 +268,23 @@ int main(void)
   UART_Q_Init();
   
   // LPF 상태 변수 초기화 (첫 ADC 값으로)
-  HAL_Delay(1); // ADC 안정화 대기
-  filtered_v_code = (float)HAL_ADC_GetValue(&hadc1);
-  filtered_i_code = (float)HAL_ADC_GetValue(&hadc2);
+  HAL_Delay(10); // ADC 안정화 대기 (더 길게)
+  
+  // 여러 샘플 평균으로 초기화 (안정적)
+  float sum_v = 0.0f, sum_i = 0.0f;
+  for(int n = 0; n < 10; n++) {
+      sum_v += (float)HAL_ADC_GetValue(&hadc1);
+      sum_i += (float)HAL_ADC_GetValue(&hadc2);
+      HAL_Delay(1);
+  }
+  filtered_v_code = sum_v / 10.0f;
+  filtered_i_code = sum_i / 10.0f;
+  
+  // 로컬 static 변수는 TIM6 콜백 시작 시 자동 초기화됨 (0.0f)
+  // 첫 몇 샘플 동안 빠르게 수렴함
+  
+  // 이제 TIM6 인터럽트 시작 (초기화 완료 후)
+  HAL_TIM_Base_Start_IT(&htim6);
 
   /* FDCAN Start */
   if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
@@ -458,7 +377,7 @@ static void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.GainCompensation = 0;
@@ -529,7 +448,7 @@ static void MX_ADC2_Init(void)
   /** Common config
   */
   hadc2.Instance = ADC2;
-  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc2.Init.Resolution = ADC_RESOLUTION_12B;
   hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc2.Init.GainCompensation = 0;
@@ -629,78 +548,6 @@ static void MX_FDCAN2_Init(void)
 }
 
 /**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 3;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 499;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
-  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
-  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
-  sBreakDeadTimeConfig.Break2Filter = 0;
-  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
   * @brief TIM6 Initialization Function
   * @param None
   * @retval None
@@ -735,44 +582,6 @@ static void MX_TIM6_Init(void)
   /* USER CODE BEGIN TIM6_Init 2 */
 
   /* USER CODE END TIM6_Init 2 */
-
-}
-
-/**
-  * @brief TIM7 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM7_Init(void)
-{
-
-  /* USER CODE BEGIN TIM7_Init 0 */
-
-  /* USER CODE END TIM7_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM7_Init 1 */
-
-  /* USER CODE END TIM7_Init 1 */
-  htim7.Instance = TIM7;
-  htim7.Init.Prescaler = 19;
-  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim7.Init.Period = 639;
-  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM7_Init 2 */
-
-  /* USER CODE END TIM7_Init 2 */
 
 }
 
@@ -864,6 +673,14 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin : PA8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF6_TIM1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PA9 */
   GPIO_InitStruct.Pin = GPIO_PIN_9;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -885,17 +702,17 @@ static void MX_GPIO_Init(void)
 void CAN_Send_Status_Response(void)
 {
     // 1. 최신 동시 샘플 추출 (전류만 사용)
-    uint16_t v_code, i_code;
-    ReadLatest(&v_code, &i_code);
+//    uint16_t v_code, i_code;
+//    ReadLatest(&v_code, &i_code);
 
     // 2. 물리량으로 변환 (전압/전류 모두 필터링된 값 사용)
     uint16_t voltage_mv = (uint16_t)Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
     uint16_t current_ma = (uint16_t)Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
-    uint16_t duty_permille = (uint16_t)(g_brake_duty * 1000.0f);
+    uint16_t duty_permille = 0; // PWM 안써서 0
 
     // 3. 핀 상태 읽기
     uint8_t pin_status = 0;
-    pin_status |= (PWM_InstantBit() & 0x01) << 1;    // Bit 1: PWM 핀
+//    pin_status |= (PWM_InstantBit() & 0x01) << 1;    // Bit 1: PWM 핀: 미사용으로 인한 0
     pin_status |= (GPIO_InstantBit() & 0x01) << 0;   // Bit 0: 히스테리시스 핀
 
     // 4. CAN Tx 메시지 설정
@@ -923,7 +740,7 @@ void CAN_Send_Status_Response(void)
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK)
     {
         // 전송 실패
-//        Error_Handler();
+        Error_Handler();
     }
 }
 
@@ -976,51 +793,39 @@ void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
 }
 
 /**
- * @brief AWD outOfWindow콜백을 통한 GPIO 제어
- * @note 클램프high전압보다 크면 게이트 켜고, 클램프low전압보다 작으면 게이트 끔
- */
-//void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef* hadc) {
-//    if (hadc->Instance == ADC1) {
-//        uint16_t v = (uint16_t) HAL_ADC_GetValue(hadc);
-//
-//        if (!gpio_gate_on && v > AWD_HIGH_CODE) {
-//            GPIO_GateOn();
-//        }
-//        else if (gpio_gate_on && v < AWD_LOW_CODE) {
-//            GPIO_GateOff();
-//        }
-//    }
-//}
-
-/**
  * @brief TIM_period 콜백함수
  * @note TIM6: LPF 및 히스테리시스 제어
- *       TIM7: PI 제어 (현재 코드에 포함되어 있으나, TIM7은 기본적으로 시작되지 않음. 필요시 HAL_TIM_Base_Start_IT(&htim7)로 활성화 가능)
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim->Instance == TIM7) {
-        uint16_t code = (uint16_t) HAL_ADC_GetValue(&hadc1);
-
-        float v_adc  = ( (float)code * 3.3f ) / 4095.0f;
-        float v_bus  = v_adc * 40.0f;
-
-        float d = BrakePI_Step(v_bus, V_REF, CTRL_Ts);
-        BrakePWM_SetDuty(d);
-    }
+    if (htim->Instance == TIM6) {
         // 125kHz로 실행되는 LPF 및 히스테리시스 제어
         // HAL 함수를 사용하여 ADC 값 읽기 (125kHz 빠른 샘플링)
         uint16_t v = (uint16_t) HAL_ADC_GetValue(&hadc1);
         uint16_t i = (uint16_t) HAL_ADC_GetValue(&hadc2);
 
-        // LPF 적용
+        // LPF 적용 (float, 전역 변수 직접 사용)
         filtered_v_code += LPF_ALPHA * ((float)v - filtered_v_code);
         filtered_i_code += LPF_ALPHA * ((float)i - filtered_i_code);
 
-        // 필터링된 값으로 히스테리시스 제어
-        if (!gpio_gate_on && filtered_v_code > (float)AWD_HIGH_CODE) {
+        // 히스테리시스 제어
+//#define FILTERED_CONTROL
+#define RAW_CONTROL
+
+#ifdef RAW_CONTROL
+        if (!gpio_gate_on && v > AWD_HIGH_CODE) {
+#endif
+#ifdef FILTERED_CONTROL
+        if (!gpio_gate_on && filtered_v_code > AWD_HIGH_CODE) {
+#endif
             GPIO_GateOn();
         }
-        else if (gpio_gate_on && filtered_v_code < (float)AWD_LOW_CODE) {
+
+#ifdef RAW_CONTROL
+        else if (gpio_gate_on && v < AWD_LOW_CODE) {
+#endif
+#ifdef FILTERED_CONTROL
+        else if (gpio_gate_on && filtered_v_code < AWD_LOW_CODE) {
+#endif
             GPIO_GateOff();
         }
     }
