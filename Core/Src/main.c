@@ -72,7 +72,6 @@ uint16_t high_th  = 2731; // 43.5V
 uint16_t low_th = 2712; // 42.5V
 
 volatile uint8_t gpio_gate_on = 0; // GPIO 제어 핀 상태
-volatile uint8_t pwm_on = 0; // PWM 제어 핀 상태, 현재 미사용
 
 // 디바운싱 설정
 static uint8_t debounce_count = 4;  // 연속된 샘플 개수 (변경 가능)
@@ -693,26 +692,22 @@ static void MX_GPIO_Init(void)
 
 /**
   * @brief  FDCAN Tx, 응답 전송
-  * @note   ID:0x100, DLC:8
+  * @note   ID:0x100, DLC:5
   */
-volatile uint32_t cantest = 0;
 void CAN_Send_Status_Response(void) {
 
     // 전압, 전류
     uint16_t voltage_mv = (uint16_t)Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
     uint16_t current_ma = (uint16_t)Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
-    uint16_t duty_permille = 0; // PWM 안써서 0
 
     // 핀 상태
-    uint8_t pin_status = 0;
-//    pin_status |= (PWM_InstantBit() & 0x01) << 1;    // Bit 1: PWM 핀: 미사용으로 인한 0
-    pin_status |= (GPIO_InstantBit() & 0x01) << 0;   // Bit 0: 히스테리시스 핀
+    uint8_t pin_status = GPIO_InstantBit();
 
     // CAN Tx 메시지 설정
     TxHeader.Identifier = 0x100;
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = FDCAN_DLC_BYTES_8;
+    TxHeader.DataLength = FDCAN_DLC_BYTES_5;
     TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
     TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
     TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
@@ -724,17 +719,13 @@ void CAN_Send_Status_Response(void) {
     TxData[1] = voltage_mv & 0xFF;
     TxData[2] = (current_ma >> 8) & 0xFF;
     TxData[3] = current_ma & 0xFF;
-    TxData[4] = (duty_permille >> 8) & 0xFF;
-    TxData[5] = duty_permille & 0xFF;
-    TxData[6] = pin_status;
-    TxData[7] = 0x00; // Reserved
+    TxData[4] = pin_status;
 
     // 메시지 전송
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
         // 전송 실패
         Error_Handler();
     }
-    cantest++;
 }
 
 /**
