@@ -33,22 +33,14 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define V_BUF_LEN 256U
-#define I_BUF_LEN 256U
+#define V_BUF_LEN 8U
+#define I_BUF_LEN 8U
 
 #define ADC1_VOLT_CHANNEL ADC_CHANNEL_1
 #define ADC2_CURR_CHANNEL ADC_CHANNEL_3
 
-// GPIO 제어 핀
-#define GATE_GPIO_PORT GPIOA
-#define GATE_GPIO_PIN  GPIO_PIN_9
-
-// AWD 임계(3.3V, 1/40 분배)
-#define AWD_HIGH_CODE 2450U // 25.5V (Heuristic)
-#define AWD_LOW_CODE  2397U // 22.5V
-
 // LPF
-#define SAMPLING_FREQ 125000.0f
+#define SAMPLING_FREQ 250000.0f
 #define CUTOFF_FREQ   1000.0f
 #define PI            3.14159265359f
 #define LPF_ALPHA     ( (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ) )
@@ -75,24 +67,34 @@ UART_HandleTypeDef huart2;
 uint16_t v_buf[V_BUF_LEN]; // ADC1(전압) DMA 버퍼
 uint16_t i_buf[I_BUF_LEN]; // ADC2(전류) DMA 버퍼
 
-// 최신 샘플 캐시: DMA 콜백에서 갱신하여 사용
-uint16_t v_latest = 0;
-uint16_t i_latest = 0;
+// 전압 클램핑 ADC 코드
+uint16_t high_th  = 2731; // 43.5V
+uint16_t low_th = 2712; // 42.5V
 
 volatile uint8_t gpio_gate_on = 0; // GPIO 제어 핀 상태
 volatile uint8_t pwm_on = 0; // PWM 제어 핀 상태, 현재 미사용
 
+// 디바운싱 설정
+static uint8_t debounce_count = 4;  // 연속된 샘플 개수 (변경 가능)
+static uint8_t debounce_high_cnt = 0;  // high 임계값 초과 카운터
+static uint8_t debounce_low_cnt = 0;   // low 임계값 미만 카운터
 
-// LPF 상태 변수 (통신용 - 외부 접근)
+
+// 필터된 값
 static volatile float filtered_v_code = 0.0f;
 static volatile float filtered_i_code = 0.0f;
 
 
+// MA 필터된 값
+static volatile float v_ma = 0.0f;
+static volatile float i_ma = 0.0f;
+
+
 /* CAN-BUS */
-FDCAN_TxHeaderTypeDef   TxHeader;
-FDCAN_RxHeaderTypeDef   RxHeader;
-uint8_t               TxData[8];
-uint8_t               RxData[8];
+FDCAN_TxHeaderTypeDef TxHeader;
+FDCAN_RxHeaderTypeDef RxHeader;
+uint8_t TxData[8];
+uint8_t RxData[8];
 
 /* USER CODE END PV */
 
@@ -118,15 +120,13 @@ void ADC_StartAll(void) {
 
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)v_buf, V_BUF_LEN);
     HAL_ADC_Start_DMA(&hadc2, (uint32_t*)i_buf, I_BUF_LEN);
-
-    // TIM6 시작은 외부에서 (초기화 후) 하도록 변경
-    // HAL_TIM_Base_Start_IT(&htim6);
 }
 
 //GPIO 히스테리시스 제어용 (최적화: 직접 레지스터 접근)
 static inline void GPIO_GateOn(void) {
     GPIOA->BSRR = GPIO_PIN_9;  // 직접 레지스터 쓰기 (HAL 방식보다 빠름)
     gpio_gate_on = 1;
+//    high_th  = 2731; // 43.5V
 }
 static inline void GPIO_GateOff(void) {
     GPIOA->BSRR = (uint32_t)GPIO_PIN_9 << 16U;  // Reset 비트
@@ -135,7 +135,7 @@ static inline void GPIO_GateOff(void) {
 
 // GPIO 제어핀 상태
 static inline uint8_t GPIO_InstantBit(void) {
-    return (HAL_GPIO_ReadPin(GATE_GPIO_PORT, GATE_GPIO_PIN) == GPIO_PIN_SET) ? 1u : 0u;
+    return (HAL_GPIO_ReadPin(Gate_GPIO_Port, Gate_Pin) == GPIO_PIN_SET) ? 1u : 0u;
 }
 
 // adc값->mV
@@ -281,17 +281,15 @@ int main(void)
   // 로컬 static 변수는 TIM6 콜백 시작 시 자동 초기화됨 (0.0f)
   // 첫 몇 샘플 동안 빠르게 수렴함
   
-  // 이제 TIM6 인터럽트 시작 (초기화 완료 후)
+  // TIM6 인터럽트 시작 (초기화 완료 후)
   HAL_TIM_Base_Start_IT(&htim6);
 
   /* FDCAN Start */
-  if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
-  {
+  if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK) {
       Error_Handler();
   }
 
-  if (HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
-  {
+  if (HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
       Error_Handler();
   }
 
@@ -474,7 +472,7 @@ static void MX_ADC2_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_3;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_24CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -510,10 +508,10 @@ static void MX_FDCAN2_Init(void)
   hfdcan2.Init.AutoRetransmission = DISABLE;
   hfdcan2.Init.TransmitPause = DISABLE;
   hfdcan2.Init.ProtocolException = DISABLE;
-  hfdcan2.Init.NominalPrescaler = 10;
+  hfdcan2.Init.NominalPrescaler = 17;
   hfdcan2.Init.NominalSyncJumpWidth = 1;
-  hfdcan2.Init.NominalTimeSeg1 = 12;
-  hfdcan2.Init.NominalTimeSeg2 = 4;
+  hfdcan2.Init.NominalTimeSeg1 = 7;
+  hfdcan2.Init.NominalTimeSeg2 = 2;
   hfdcan2.Init.DataPrescaler = 1;
   hfdcan2.Init.DataSyncJumpWidth = 1;
   hfdcan2.Init.DataTimeSeg1 = 1;
@@ -563,9 +561,9 @@ static void MX_TIM6_Init(void)
 
   /* USER CODE END TIM6_Init 1 */
   htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 9;
+  htim6.Init.Prescaler = 15;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 127;
+  htim6.Init.Period = 84;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -669,7 +667,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(Gate_GPIO_Port, Gate_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PA8 */
   GPIO_InitStruct.Pin = GPIO_PIN_8;
@@ -679,12 +677,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF6_TIM1;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA9 */
-  GPIO_InitStruct.Pin = GPIO_PIN_9;
+  /*Configure GPIO pin : Gate_Pin */
+  GPIO_InitStruct.Pin = Gate_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(Gate_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -697,23 +695,20 @@ static void MX_GPIO_Init(void)
   * @brief  FDCAN Tx, 응답 전송
   * @note   ID:0x100, DLC:8
   */
-void CAN_Send_Status_Response(void)
-{
-    // 1. 최신 동시 샘플 추출 (전류만 사용)
-//    uint16_t v_code, i_code;
-//    ReadLatest(&v_code, &i_code);
+volatile uint32_t cantest = 0;
+void CAN_Send_Status_Response(void) {
 
-    // 2. 물리량으로 변환 (전압/전류 모두 필터링된 값 사용)
+    // 전압, 전류
     uint16_t voltage_mv = (uint16_t)Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
     uint16_t current_ma = (uint16_t)Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
     uint16_t duty_permille = 0; // PWM 안써서 0
 
-    // 3. 핀 상태 읽기
+    // 핀 상태
     uint8_t pin_status = 0;
 //    pin_status |= (PWM_InstantBit() & 0x01) << 1;    // Bit 1: PWM 핀: 미사용으로 인한 0
     pin_status |= (GPIO_InstantBit() & 0x01) << 0;   // Bit 0: 히스테리시스 핀
 
-    // 4. CAN Tx 메시지 설정
+    // CAN Tx 메시지 설정
     TxHeader.Identifier = 0x100;
     TxHeader.IdType = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType = FDCAN_DATA_FRAME;
@@ -724,7 +719,7 @@ void CAN_Send_Status_Response(void)
     TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     TxHeader.MessageMarker = 0;
 
-    // 5. 데이터 패킹 (Big-Endian)
+    // 데이터 패킹 (Big-Endian)
     TxData[0] = (voltage_mv >> 8) & 0xFF;
     TxData[1] = voltage_mv & 0xFF;
     TxData[2] = (current_ma >> 8) & 0xFF;
@@ -734,31 +729,27 @@ void CAN_Send_Status_Response(void)
     TxData[6] = pin_status;
     TxData[7] = 0x00; // Reserved
 
-    // 6. 메시지 전송
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK)
-    {
+    // 메시지 전송
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
         // 전송 실패
         Error_Handler();
     }
+    cantest++;
 }
 
 /**
   * @brief  FDCAN Rx FIFO 0 수신 콜백
   * @note   ID 0x101 메시지 수신 시 호출됨
   */
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
-{
-    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
-    {
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
+    if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET) {
         // FIFO 0에서 메시지 수신
-        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
-        {
+        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK) {
             Error_Handler();
         }
 
         // 요청 메시지인지 확인 (ID: 0x101, DLC: 1, Data: 0x01)
-        if (RxHeader.Identifier == 0x101 && RxHeader.DataLength == FDCAN_DLC_BYTES_1 && RxData[0] == 0x01)
-        {
+        if (RxHeader.Identifier == 0x101 && RxHeader.DataLength == FDCAN_DLC_BYTES_1 && RxData[0] == 0x01) {
             CAN_Send_Status_Response();
         }
     }
@@ -766,27 +757,27 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 
 /**
  * @brief 반핑퐁 함수
- * @note MCU 부담 감소, 통신 관련 함수 여기에 작성
+ * @note MCU 부담 감소, MA 계산(디버그용)
  */
 void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
     if (hdma == hadc1.DMA_Handle) {
         // v_buf[0 .. V_BUF_LEN/2-1] 처리
-        v_latest = v_buf[V_BUF_LEN/2 - 1];
+        v_ma = v_buf[V_BUF_LEN/2 - 1];
     }
     else if (hdma == hadc2.DMA_Handle) {
         // i_buf[0 .. I_BUF_LEN/2-1] 처리
-        i_latest = i_buf[I_BUF_LEN/2 - 1];
+        i_ma = i_buf[I_BUF_LEN/2 - 1];
     }
 }
 
 void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
     if (hdma == hadc1.DMA_Handle) {
         // v_buf[V_BUF_LEN/2 .. V_BUF_LEN-1] 처리
-        v_latest = v_buf[V_BUF_LEN - 1];
+        v_ma = v_buf[V_BUF_LEN - 1];
     }
     else if (hdma == hadc2.DMA_Handle) {
         // i_buf[I_BUF_LEN/2 .. I_BUF_LEN-1] 처리
-        i_latest = i_buf[I_BUF_LEN - 1];
+        i_ma = i_buf[I_BUF_LEN - 1];
     }
 }
 
@@ -805,27 +796,47 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         filtered_v_code += LPF_ALPHA * ((float)v - filtered_v_code);
         filtered_i_code += LPF_ALPHA * ((float)i - filtered_i_code);
 
-        // 히스테리시스 제어
+        // 히스테리시스 제어 (디바운싱 적용)
 //#define FILTERED_CONTROL
 #define RAW_CONTROL
 
 #ifdef RAW_CONTROL
-        if (!gpio_gate_on && v > AWD_HIGH_CODE) {
+        // 디바운싱: 연속된 N개 샘플이 임계값을 넘어야 동작
+        if (!gpio_gate_on) {
+            if (v > high_th) {
+                debounce_high_cnt++;
+                debounce_low_cnt = 0;  // 반대쪽 카운터 리셋
+                
+                if (debounce_high_cnt >= debounce_count) {
+                    GPIO_GateOn();
+                    debounce_high_cnt = 0;  // 카운터 리셋
+                }
+            } else {
+                debounce_high_cnt = 0;  // 조건 불만족 시 리셋
+            }
+        }
+        else {  // gpio_gate_on == 1
+            if (v < low_th) {
+                debounce_low_cnt++;
+                debounce_high_cnt = 0;  // 반대쪽 카운터 리셋
+                
+                if (debounce_low_cnt >= debounce_count) {
+                    GPIO_GateOff();
+                    debounce_low_cnt = 0;  // 카운터 리셋
+                }
+            } else {
+                debounce_low_cnt = 0;  // 조건 불만족 시 리셋
+            }
+        }
 #endif
 #ifdef FILTERED_CONTROL
-        if (!gpio_gate_on && filtered_v_code > AWD_HIGH_CODE) {
-#endif
+        if (!gpio_gate_on && filtered_v_code > high_th) {
             GPIO_GateOn();
         }
-
-#ifdef RAW_CONTROL
-        else if (gpio_gate_on && v < AWD_LOW_CODE) {
-#endif
-#ifdef FILTERED_CONTROL
-        else if (gpio_gate_on && filtered_v_code < AWD_LOW_CODE) {
-#endif
+        else if (gpio_gate_on && filtered_v_code < low_th) {
             GPIO_GateOff();
         }
+#endif
     }
 }
 
