@@ -29,10 +29,10 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum {
-    DEBOUNCING,
-    MA,
-    LPF,
-    RAW
+    DEBOUNCING = 0,
+    MA = 1,
+    LPF = 2,
+    RAW = 3
 } FilterType;
 /* USER CODE END PTD */
 
@@ -80,10 +80,9 @@ static uint8_t debounce_count = 4;  // 연속된 샘플 개수 (변경 가능)
 static uint8_t debounce_high_cnt = 0;  // high 임계값 초과 카운터
 static uint8_t debounce_low_cnt = 0;   // low 임계값 미만 카운터
 
-float sampling_freq = 125000.0f;
-float cutoff_freq =  1000.0f;
+uint32_t sampling_freq = 125000;
+unit32_t cutoff_freq =  1000;
 const float pi =  3.14159265359f;
-float lpf_alpha = (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ);
 
 // 필터된 값
 static volatile float filtered_v_code = 0.0f;
@@ -153,21 +152,6 @@ static inline int32_t Code_to_ImA(uint16_t code) {
     return (int32_t) (I * 1000.0f);
 }
 
-// 가장 최신 VI 샘플
-static void ReadLatest(uint16_t* v_code, uint16_t* i_code) {
-    // DMA 잔량(CNDTR)로 현재 쓰기 위치 계산
-    uint32_t pos_v = VI_BUF_LEN - (uint32_t)(hadc1.DMA_Handle->Instance->CNDTR);
-    uint32_t pos_i = VI_BUF_LEN - (uint32_t)(hadc2.DMA_Handle->Instance->CNDTR);
-    pos_v %= VI_BUF_LEN; pos_i %= VI_BUF_LEN;
-
-    // 두 DMA의 진행이 미세하게 다를 수 있으니 더 작은 쪽을 기준
-    uint32_t pos_min = (pos_v < pos_i) ? pos_v : pos_i;
-
-    // 직전에 완료된 인덱스 = pos_min - 1 (링 보정)
-    uint32_t idx = (pos_min == 0) ? (VI_BUF_LEN - 1) : (pos_min - 1);
-    *v_code = v_buf[idx];
-    *i_code = i_buf[idx];
-}
 
 /* ==== UART 명령 ==== */
 #define RX_BUFSZ 16
@@ -682,45 +666,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-/**
-  * @brief  FDCAN Tx, 응답 전송
-  * @note   ID:0x100, DLC:5
-  */
-void CAN_Send_Status_Response(void) {
-
-    // 전압, 전류
-    uint16_t voltage_mv = (uint16_t)Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
-    uint16_t current_ma = (uint16_t)Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
-
-    // 핀 상태
-    uint8_t pin_status = GPIO_InstantBit();
-
-    // CAN Tx 메시지 설정
-    TxHeader.Identifier = 0x100;
-    TxHeader.IdType = FDCAN_STANDARD_ID;
-    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = FDCAN_DLC_BYTES_5;
-    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
-    TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
-    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-    TxHeader.MessageMarker = 0;
-
-    // 데이터 패킹 (Big-Endian)
-    TxData[0] = (voltage_mv >> 8) & 0xFF;
-    TxData[1] = voltage_mv & 0xFF;
-    TxData[2] = (current_ma >> 8) & 0xFF;
-    TxData[3] = current_ma & 0xFF;
-    TxData[4] = pin_status;
-
-    // 메시지 전송
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
-        // 전송 실패
-        Error_Handler();
-    }
-}
-
 /**
   * @brief  FDCAN Rx FIFO 0 수신 콜백
   * @note   ID 0x101 메시지 수신 시 호출됨
@@ -732,9 +677,125 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
             Error_Handler();
         }
 
-        // 요청 메시지인지 확인 (ID: 0x101, DLC: 1, Data: 0x01)
-        if (RxHeader.Identifier == 0x101 && RxHeader.DataLength == FDCAN_DLC_BYTES_1 && RxData[0] == 0x01) {
-            CAN_Send_Status_Response();
+        // 메시지 확인 (ID: 0x101)
+        if (RxHeader.Identifier == 0x101) {
+            // 요청 메시지
+            if (RxHeader.DataLength == FDCAN_DLC_BYTES_1 && RxData[0] == 0x01) {
+                // 전압, 전류
+                uint16_t voltage_mv = (uint16_t)Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
+                uint16_t current_ma = (uint16_t)Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
+
+                // 핀 상태
+                uint8_t pin_status = GPIO_InstantBit();
+
+                // CAN Tx 메시지 설정
+                TxHeader.Identifier = 0x100;
+                TxHeader.IdType = FDCAN_STANDARD_ID;
+                TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+                TxHeader.DataLength = FDCAN_DLC_BYTES_5;
+                TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+                TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+                TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+                TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+                TxHeader.MessageMarker = 0;
+
+                // 데이터 패킹 (Big-Endian)
+                TxData[0] = (voltage_mv >> 8) & 0xFF;
+                TxData[1] = voltage_mv & 0xFF;
+                TxData[2] = (current_ma >> 8) & 0xFF;
+                TxData[3] = current_ma & 0xFF;
+                TxData[4] = pin_status;
+
+                // 메시지 전송
+                if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
+                    // 전송 실패
+                    Error_Handler();
+                }
+            }
+
+            // 필터 변경 메시지
+            else if (RxHeader.DataLength == FDCAN_DLC_BYTES_2 && RxData[0] == 0x02) {
+                if (RxData[1] >= 0 && RxData[1] <= 3) {
+                    // 입력받은 필터값으로 변경
+                    filter_mode = (FilterType) RxData[1];
+
+                    // CAN Tx 메시지 설정
+                    TxHeader.Identifier = 0x100;
+                    TxHeader.IdType = FDCAN_STANDARD_ID;
+                    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+                    TxHeader.DataLength = FDCAN_DLC_BYTES_2;
+                    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+                    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+                    TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+                    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+                    TxHeader.MessageMarker = 0;
+
+                    // 데이터 패킹 (Big-Endian)
+                    TxData[0] = 0x02;
+                    TxData[1] = RxData[1];
+
+                    // 메시지 전송
+                    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
+                        // 전송 실패
+                        Error_Handler();
+                    }
+                }
+
+                // 잘못된 값 들어올 경우 에러
+                else {
+                    // CAN Tx 메시지 설정
+                    TxHeader.Identifier = 0x100;
+                    TxHeader.IdType = FDCAN_STANDARD_ID;
+                    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+                    TxHeader.DataLength = FDCAN_DLC_BYTES_2;
+                    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+                    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+                    TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+                    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+                    TxHeader.MessageMarker = 0;
+
+                    // 데이터 패킹 (Big-Endian)
+                    TxData[0] = 0x02;
+                    TxData[1] = 0x00;
+
+                    // 메시지 전송
+                    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
+                        // 전송 실패
+                        Error_Handler();
+                    }
+                }
+            }
+
+            // LPF 차단주파수 설정
+            if (RxHeader.DataLength == FDCAN_DLC_BYTES_5 && RxData[0] == 0x03) {
+                cutoff_freq =
+                            ((uint32_t)RxData[1] << 24) |
+                            ((uint32_t)RxData[2] << 16) |
+                            ((uint32_t)RxData[3] << 8)  |
+                            (uint32_t)RxData[4];
+
+                // CAN Tx 메시지 설정
+                TxHeader.Identifier = 0x100;
+                TxHeader.IdType = FDCAN_STANDARD_ID;
+                TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+                TxHeader.DataLength = FDCAN_DLC_BYTES_5;
+                TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+                TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+                TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+                TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+                TxHeader.MessageMarker = 0;
+
+                // 데이터 패킹 (Big-Endian)
+                for (int i = 0; i <= 5; i++) {
+                    TxData[i] = RxData[i];
+                }
+
+                // 메시지 전송
+                if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) != HAL_OK) {
+                    // 전송 실패
+                    Error_Handler();
+                }
+            }
         }
     }
 }
@@ -763,7 +824,6 @@ void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
         }
     }
 }
-
 void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
     if (filter_mode == MA) {
         if (hdma == hadc1.DMA_Handle) {
@@ -797,6 +857,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
         // LPF 적용 (float, 전역 변수 직접 사용)
         if (filter_mode == LPF) {
+            float lpf_alpha = ((2.0f * pi * (float) cutoff_freq) / (((float) sampling_freq) + 2.0f * pi * ((float) cutoff_freq)));
             filtered_v_code += lpf_alpha * ((float)v - filtered_v_code);
             filtered_i_code += lpf_alpha * ((float)i - filtered_i_code);
         }
