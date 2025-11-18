@@ -28,22 +28,21 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+    DEBOUNCING,
+    MA,
+    LPF,
+    RAW
+} FilterType;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define VI_BUF_LEN 8
-#define VI_SHIFTER 3
 
 #define ADC1_VOLT_CHANNEL ADC_CHANNEL_1
 #define ADC2_CURR_CHANNEL ADC_CHANNEL_3
 
-// LPF
-#define SAMPLING_FREQ 250000.0f
-#define CUTOFF_FREQ   1000.0f
-#define PI            3.14159265359f
-#define LPF_ALPHA     ( (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ) )
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,20 +72,22 @@ uint16_t low_th = 2712; // 42.5V
 
 volatile uint8_t gpio_gate_on = 0; // GPIO 제어 핀 상태
 
+// 기본 필터 디바운싱
+FilterType filter_mode = DEBOUNCING;
+
 // 디바운싱 설정
 static uint8_t debounce_count = 4;  // 연속된 샘플 개수 (변경 가능)
 static uint8_t debounce_high_cnt = 0;  // high 임계값 초과 카운터
 static uint8_t debounce_low_cnt = 0;   // low 임계값 미만 카운터
 
+float sampling_freq = 125000.0f;
+float cutoff_freq =  1000.0f;
+const float pi =  3.14159265359f;
+float lpf_alpha = (2.0f * PI * CUTOFF_FREQ) / (SAMPLING_FREQ + 2.0f * PI * CUTOFF_FREQ);
 
 // 필터된 값
 static volatile float filtered_v_code = 0.0f;
 static volatile float filtered_i_code = 0.0f;
-
-
-// MA 필터된 값
-static volatile float v_ma = 0.0f;
-static volatile float i_ma = 0.0f;
 
 
 /* CAN-BUS */
@@ -193,27 +194,19 @@ static void UART_HandleLine(const char* line_in) {
     while (L && (line_in[L-1]=='\r' || line_in[L-1]==' ' || line_in[L-1]=='\t')) --L; // 공백이나 '\r' 이면 트림
     memcpy(line, line_in, L); line[L] = '\0'; // 문자열 끝에 NULL
 
-    if (strcmp(line, "Q") == 0) { // Q 명령: 현재 V, I, GPIO상태, PWM상태, PWM추기 출력
-
-        // 최신 동시 샘플 추출 (전류만 사용)
-        uint16_t v_code, i_code;
-        ReadLatest(&v_code, &i_code);
+    if (strcmp(line, "Q") == 0) { // Q 명령: 현재 V, I, GPIO상태 출력
 
         // 물리량 환산 (전압/전류 모두 필터링된 값 사용)
         int32_t v_mV = Code_to_VmV((uint16_t)(filtered_v_code + 0.5f));
         int32_t i_mA = Code_to_ImA((uint16_t)(filtered_i_code + 0.5f));
 
         // 히스테리시스 gate 핀 상태
-        uint8_t gpio   = GPIO_InstantBit();
-
-        // PWM 채널 미사용으로 인한 0 전송
-        uint8_t pwm_on = 0;
-        int duty_ppt = 0;
+        uint8_t gpio = GPIO_InstantBit();
 
         // 한 줄 응답
         char msg[84];
-        int n = snprintf(msg, sizeof(msg), "D,%ld,%ld,%u,%u,%d\n",
-                         (long)v_mV, (long)i_mA, (unsigned)gpio, (unsigned)pwm_on, duty_ppt);
+        int n = snprintf(msg, sizeof(msg), "D,%ld,%ld,%u\n",
+                         (long)v_mV, (long)i_mA, (unsigned)gpio);
         if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)n, 20);
     }
     else {
@@ -751,40 +744,44 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
  * @note MCU 부담 감소, MA 계산
  */
 void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
-    if (hdma == hadc1.DMA_Handle) {
-        // v_buf 앞 절반의 평균
-        v_add = 0;
-        for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
-            v_add += v_buf[i];
+    if (filter_mode == MA) {
+        if (hdma == hadc1.DMA_Handle) {
+            // v_buf 앞 절반의 평균
+            float v_add = 0.0f;
+            for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
+                v_add += v_buf[i];
+            }
+            filtered_v_code = v_add / (((float) VI_BUF_LEN) / 2.0f);
         }
-        v_ma = (v_add>>VI_SHIFTER);
-    }
-    else if (hdma == hadc2.DMA_Handle) {
-        // i_buf 앞 절반의 평균
-        i_add = 0;
-        for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
-            i_add += i_buf[i];
+        else if (hdma == hadc2.DMA_Handle) {
+            // i_buf 앞 절반의 평균
+            float i_add = 0.0f;
+            for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
+                i_add += i_buf[i];
+            }
+            filtered_i_code = i_add / (((float) VI_BUF_LEN) / 2.0f);
         }
-        i_ma = (i_add>>VI_SHIFTER);
     }
 }
 
 void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
-    if (hdma == hadc1.DMA_Handle) {
-        // v_buf 뒤 절반의 평균
-        v_add = 0;
-        for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
-            v_add += v_buf[i];
+    if (filter_mode == MA) {
+        if (hdma == hadc1.DMA_Handle) {
+            // v_buf 뒤 절반의 평균
+            float v_add = 0.0f;
+            for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
+                v_add += v_buf[i];
+            }
+            filtered_v_code = v_add / (((float) VI_BUF_LEN) / 2.0f);
         }
-        v_ma = (v_add>>VI_SHIFTER);
-    }
-    else if (hdma == hadc2.DMA_Handle) {
-        // i_buf 뒤 절반의 평균
-        i_add = 0;
-        for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
-            i_add += i_buf[i];
+        else if (hdma == hadc2.DMA_Handle) {
+            // i_buf 뒤 절반의 평균
+            float i_add = 0.0f;
+            for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
+                i_add += i_buf[i];
+            }
+            filtered_i_code = i_add / (((float) VI_BUF_LEN) / 2.0f);
         }
-        i_ma = (i_add>>VI_SHIFTER);
     }
 }
 
@@ -794,56 +791,58 @@ void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM6) {
-        // 125kHz로 실행되는 LPF 및 히스테리시스 제어
-        // HAL 함수를 사용하여 ADC 값 읽기 (125kHz 빠른 샘플링)
+        // ADC 값 읽기
         uint16_t v = (uint16_t) HAL_ADC_GetValue(&hadc1);
         uint16_t i = (uint16_t) HAL_ADC_GetValue(&hadc2);
 
         // LPF 적용 (float, 전역 변수 직접 사용)
-        filtered_v_code += LPF_ALPHA * ((float)v - filtered_v_code);
-        filtered_i_code += LPF_ALPHA * ((float)i - filtered_i_code);
+        if (filter_mode == LPF) {
+            filtered_v_code += lpf_alpha * ((float)v - filtered_v_code);
+            filtered_i_code += lpf_alpha * ((float)i - filtered_i_code);
+        }
+        // raw나 debouncing이면 filtered 값에 그대로 전달
+        else if (filter_mode == RAW || filter_mode == DEBOUNCING) {
+            filtered_v_code = v;
+            filtered_i_code = i;
+        }
 
-        // 히스테리시스 제어 (디바운싱 적용)
-//#define FILTERED_CONTROL
-#define RAW_CONTROL
-
-#ifdef RAW_CONTROL
         // 디바운싱: 연속된 N개 샘플이 임계값을 넘어야 동작
-        if (!gpio_gate_on) {
-            if (v > high_th) {
-                debounce_high_cnt++;
-                debounce_low_cnt = 0;  // 반대쪽 카운터 리셋
-                
-                if (debounce_high_cnt >= debounce_count) {
-                    GPIO_GateOn();
-                    debounce_high_cnt = 0;  // 카운터 리셋
+        if (filter_mode == DEBOUNCING) {
+            if (!gpio_gate_on) {
+                if (v > high_th) {
+                    debounce_high_cnt++;
+                    debounce_low_cnt = 0;  // 반대쪽 카운터 리셋
+
+                    if (debounce_high_cnt >= debounce_count) {
+                        GPIO_GateOn();
+                        debounce_high_cnt = 0;  // 카운터 리셋
+                    }
+                } else {
+                    debounce_high_cnt = 0;  // 조건 불만족 시 리셋
                 }
-            } else {
-                debounce_high_cnt = 0;  // 조건 불만족 시 리셋
+            }
+            else {  // gpio_gate_on == 1
+                if (v < low_th) {
+                    debounce_low_cnt++;
+                    debounce_high_cnt = 0;  // 반대쪽 카운터 리셋
+
+                    if (debounce_low_cnt >= debounce_count) {
+                        GPIO_GateOff();
+                        debounce_low_cnt = 0;  // 카운터 리셋
+                    }
+                } else {
+                    debounce_low_cnt = 0;  // 조건 불만족 시 리셋
+                }
             }
         }
-        else {  // gpio_gate_on == 1
-            if (v < low_th) {
-                debounce_low_cnt++;
-                debounce_high_cnt = 0;  // 반대쪽 카운터 리셋
-                
-                if (debounce_low_cnt >= debounce_count) {
-                    GPIO_GateOff();
-                    debounce_low_cnt = 0;  // 카운터 리셋
-                }
-            } else {
-                debounce_low_cnt = 0;  // 조건 불만족 시 리셋
-            }
-        }
-#endif
-#ifdef FILTERED_CONTROL
+
+        // 이외의 경우, 필터값이 임계값 넘기면 동작
         if (!gpio_gate_on && filtered_v_code > high_th) {
             GPIO_GateOn();
         }
         else if (gpio_gate_on && filtered_v_code < low_th) {
             GPIO_GateOff();
         }
-#endif
     }
 }
 
