@@ -33,8 +33,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define V_BUF_LEN 8U
-#define I_BUF_LEN 8U
+#define VI_BUF_LEN 8
+#define VI_SHIFTER 3
 
 #define ADC1_VOLT_CHANNEL ADC_CHANNEL_1
 #define ADC2_CURR_CHANNEL ADC_CHANNEL_3
@@ -64,8 +64,8 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint16_t v_buf[V_BUF_LEN]; // ADC1(전압) DMA 버퍼
-uint16_t i_buf[I_BUF_LEN]; // ADC2(전류) DMA 버퍼
+uint16_t v_buf[VI_BUF_LEN]; // ADC1(전압) DMA 버퍼
+uint16_t i_buf[VI_BUF_LEN]; // ADC2(전류) DMA 버퍼
 
 // 전압 클램핑 ADC 코드
 uint16_t high_th  = 2731; // 43.5V
@@ -118,8 +118,8 @@ void ADC_StartAll(void) {
     HAL_ADCEx_Calibration_Start(&hadc1, ADC_DIFFERENTIAL_ENDED);
     HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)v_buf, V_BUF_LEN);
-    HAL_ADC_Start_DMA(&hadc2, (uint32_t*)i_buf, I_BUF_LEN);
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)v_buf, VI_BUF_LEN);
+    HAL_ADC_Start_DMA(&hadc2, (uint32_t*)i_buf, VI_BUF_LEN);
 }
 
 //GPIO 히스테리시스 제어용 (최적화: 직접 레지스터 접근)
@@ -156,15 +156,15 @@ static inline int32_t Code_to_ImA(uint16_t code) {
 // 가장 최신 VI 샘플
 static void ReadLatest(uint16_t* v_code, uint16_t* i_code) {
     // DMA 잔량(CNDTR)로 현재 쓰기 위치 계산
-    uint32_t pos_v = V_BUF_LEN - (uint32_t)(hadc1.DMA_Handle->Instance->CNDTR);
-    uint32_t pos_i = I_BUF_LEN - (uint32_t)(hadc2.DMA_Handle->Instance->CNDTR);
-    pos_v %= V_BUF_LEN; pos_i %= I_BUF_LEN;
+    uint32_t pos_v = VI_BUF_LEN - (uint32_t)(hadc1.DMA_Handle->Instance->CNDTR);
+    uint32_t pos_i = VI_BUF_LEN - (uint32_t)(hadc2.DMA_Handle->Instance->CNDTR);
+    pos_v %= VI_BUF_LEN; pos_i %= VI_BUF_LEN;
 
     // 두 DMA의 진행이 미세하게 다를 수 있으니 더 작은 쪽을 기준
     uint32_t pos_min = (pos_v < pos_i) ? pos_v : pos_i;
 
     // 직전에 완료된 인덱스 = pos_min - 1 (링 보정)
-    uint32_t idx = (pos_min == 0) ? (V_BUF_LEN - 1) : (pos_min - 1);
+    uint32_t idx = (pos_min == 0) ? (VI_BUF_LEN - 1) : (pos_min - 1);
     *v_code = v_buf[idx];
     *i_code = i_buf[idx];
 }
@@ -757,27 +757,43 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 
 /**
  * @brief 반핑퐁 함수
- * @note MCU 부담 감소, MA 계산(디버그용)
+ * @note MCU 부담 감소, MA 계산
  */
 void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
     if (hdma == hadc1.DMA_Handle) {
-        // v_buf[0 .. V_BUF_LEN/2-1] 처리
-        v_ma = v_buf[V_BUF_LEN/2 - 1];
+        // v_buf 앞 절반의 평균
+        v_add = 0;
+        for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
+            v_add += v_buf[i];
+        }
+        v_ma = (v_add>>VI_SHIFTER);
     }
     else if (hdma == hadc2.DMA_Handle) {
-        // i_buf[0 .. I_BUF_LEN/2-1] 처리
-        i_ma = i_buf[I_BUF_LEN/2 - 1];
+        // i_buf 앞 절반의 평균
+        i_add = 0;
+        for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
+            i_add += i_buf[i];
+        }
+        i_ma = (i_add>>VI_SHIFTER);
     }
 }
 
 void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
     if (hdma == hadc1.DMA_Handle) {
-        // v_buf[V_BUF_LEN/2 .. V_BUF_LEN-1] 처리
-        v_ma = v_buf[V_BUF_LEN - 1];
+        // v_buf 뒤 절반의 평균
+        v_add = 0;
+        for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
+            v_add += v_buf[i];
+        }
+        v_ma = (v_add>>VI_SHIFTER);
     }
     else if (hdma == hadc2.DMA_Handle) {
-        // i_buf[I_BUF_LEN/2 .. I_BUF_LEN-1] 처리
-        i_ma = i_buf[I_BUF_LEN - 1];
+        // i_buf 뒤 절반의 평균
+        i_add = 0;
+        for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
+            i_add += i_buf[i];
+        }
+        i_ma = (i_add>>VI_SHIFTER);
     }
 }
 
