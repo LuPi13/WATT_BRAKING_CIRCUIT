@@ -80,8 +80,8 @@ static uint8_t debounce_count = 4;  // 연속된 샘플 개수 (변경 가능)
 static uint8_t debounce_high_cnt = 0;  // high 임계값 초과 카운터
 static uint8_t debounce_low_cnt = 0;   // low 임계값 미만 카운터
 
-uint32_t sampling_freq = 125000;
-unit32_t cutoff_freq =  1000;
+uint32_t sampling_freq = 500000;
+uint32_t cutoff_freq =  1000;
 const float pi =  3.14159265359f;
 
 // 필터된 값
@@ -801,12 +801,12 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 }
 
 /**
- * @brief 반핑퐁 함수
- * @note MCU 부담 감소, MA 계산
+ * @brief ADC Half Transfer Complete Callback (DMA 버퍼 앞 절반 채워짐)
+ * @note MA 모드일 때 앞 절반 평균 계산
  */
-void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
     if (filter_mode == MA) {
-        if (hdma == hadc1.DMA_Handle) {
+        if (hadc->Instance == ADC1) {
             // v_buf 앞 절반의 평균
             float v_add = 0.0f;
             for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
@@ -814,7 +814,7 @@ void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
             }
             filtered_v_code = v_add / (((float) VI_BUF_LEN) / 2.0f);
         }
-        else if (hdma == hadc2.DMA_Handle) {
+        else if (hadc->Instance == ADC2) {
             // i_buf 앞 절반의 평균
             float i_add = 0.0f;
             for (int i = 0; i <= (VI_BUF_LEN/2-1); i++) {
@@ -824,9 +824,13 @@ void HAL_DMA_XferHalfCpltCallback(DMA_HandleTypeDef *hdma) {
         }
     }
 }
-void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
+/**
+ * @brief ADC Transfer Complete Callback (DMA 버퍼 전체 채워짐)
+ * @note MA 모드일 때 뒤 절반 평균 계산
+ */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
     if (filter_mode == MA) {
-        if (hdma == hadc1.DMA_Handle) {
+        if (hadc->Instance == ADC1) {
             // v_buf 뒤 절반의 평균
             float v_add = 0.0f;
             for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
@@ -834,7 +838,7 @@ void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma) {
             }
             filtered_v_code = v_add / (((float) VI_BUF_LEN) / 2.0f);
         }
-        else if (hdma == hadc2.DMA_Handle) {
+        else if (hadc->Instance == ADC2) {
             // i_buf 뒤 절반의 평균
             float i_add = 0.0f;
             for (int i = VI_BUF_LEN/2; i <= (VI_BUF_LEN-1); i++) {
